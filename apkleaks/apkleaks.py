@@ -5,6 +5,8 @@ import logging.config
 import os
 import re
 import shutil
+import shlex
+import subprocess
 import sys
 import tempfile
 import threading
@@ -12,7 +14,6 @@ import threading
 from contextlib import closing
 from shutil import which
 from pathlib import Path
-from shlex import quote
 from urllib.request import urlopen
 from zipfile import ZipFile
 
@@ -89,13 +90,17 @@ class APKLeaks:
 	def decompile(self):
 		util.writeln("** Decompiling APK...", col.OKBLUE)
 		args = [self.jadx, self.file, "-d", self.tempdir]
+		# Arguments are parsed into tokens but never handed to a shell, so
+		# metacharacters in the APK path or disassembler arguments stay literal.
 		try:
-			args.extend(re.split(r"\s|=", self.disarg))
-		except Exception:
-			pass
-		comm = "%s" % (" ".join(quote(arg) for arg in args))
-		comm = comm.replace("\'","\"")
-		os.system(comm)
+			if self.disarg:
+				args.extend(shlex.split(self.disarg))
+		except ValueError as error:
+			sys.exit(util.writeln("** Invalid disassembler arguments: %s" % error, col.FAIL))
+		try:
+			subprocess.run(args, check=False)
+		except OSError as error:
+			sys.exit(util.writeln("** Failed to run disassembler: %s" % error, col.FAIL))
 
 	def extract(self, name, matches):
 		if len(matches):
@@ -111,7 +116,6 @@ class APKLeaks:
 				print(stdout)
 				self.fileout.write("%s" % (stdout + "\n" if self.json is False else ""))
 			self.fileout.write("%s" % ("\n" if self.json is False else ""))
-			self.out_json["results"].append({"name": name, "matches": matches})
 			self.scanned = True
 
 	def scanning(self):
@@ -122,20 +126,40 @@ class APKLeaks:
 		self.out_json["results"] = []
 		with open(self.pattern) as regexes:
 			regex = json.load(regexes)
-			for name, pattern in regex.items():
-				if isinstance(pattern, list):
-					for p in pattern:
-						try:
-							thread = threading.Thread(target = self.extract, args = (name, util.finder(p, self.tempdir)))
-							thread.start()
-						except KeyboardInterrupt:
-							sys.exit(util.writeln("\n** Interrupted. Aborting...", col.FAIL))
-				else:
-					try:
-						thread = threading.Thread(target = self.extract, args = (name, util.finder(pattern, self.tempdir)))
-						thread.start()
-					except KeyboardInterrupt:
-						sys.exit(util.writeln("\n** Interrupted. Aborting...", col.FAIL))
+
+		findings = {}
+		lock = threading.Lock()
+		threads = []
+
+		def collect(rule_name, rule_pattern):
+			matches = util.finder(rule_pattern, self.tempdir)
+			if matches:
+				with lock:
+					findings.setdefault(rule_name, set()).update(matches)
+
+		# Worker threads only read files and aggregate matches; they never touch
+		# the result structures or the output file, so concurrent scans cannot
+		# interleave writes or drop entries.
+		for name, pattern in regex.items():
+			patterns = pattern if isinstance(pattern, list) else [pattern]
+			for rule_pattern in patterns:
+				try:
+					thread = threading.Thread(target=collect, args=(name, rule_pattern))
+					threads.append(thread)
+					thread.start()
+				except KeyboardInterrupt:
+					sys.exit(util.writeln("\n** Interrupted. Aborting...", col.FAIL))
+		try:
+			for thread in threads:
+				thread.join()
+		except KeyboardInterrupt:
+			sys.exit(util.writeln("\n** Interrupted. Aborting...", col.FAIL))
+
+		# Serialize on the main thread in a stable, sorted order.
+		for name in sorted(findings):
+			matches = sorted(findings[name])
+			self.out_json["results"].append({"name": name, "matches": matches})
+			self.extract(name, matches)
 
 	def cleanup(self):
 		shutil.rmtree(self.tempdir)

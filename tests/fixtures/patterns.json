@@ -1,0 +1,8 @@
+{
+	"AWS_API_Key": "AKIA[0-9A-Z]{16}",
+	"Google_API_Key": "AIza[0-9A-Za-z\\-_]{35}",
+	"Endpoints": [
+		"https://[a-zA-Z0-9.-]+/[a-zA-Z0-9/_-]+",
+		"http://localhost:[0-9]+/[a-zA-Z0-9/_-]+"
+	]
+}
